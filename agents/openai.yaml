@@ -1,4 +1,4 @@
 interface:
-  display_name: "DEM 下载器"
-  short_description: "支持城市到国家尺度分块、断点续传和拼接的多源 DEM 下载器"
-  default_prompt: "使用 $download-dem 规划并下载指定区域的 DEM；根据面积自动选择窗口拼接或可续传原始瓦片。"
+  display_name: "DEM Downloader / DEM 下载器"
+  short_description: "Multi-source DEM downloads / 多源 DEM 下载"
+  default_prompt: "Use $download-dem to plan and download a DEM for an area, automatically choosing a mosaic or resumable native tiles. 使用 $download-dem 规划并下载区域 DEM，自动选择拼接或可续传原始瓦片。"
