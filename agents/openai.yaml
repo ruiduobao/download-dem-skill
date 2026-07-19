@@ -1,0 +1,4 @@
+interface:
+  display_name: "DEM 下载器"
+  short_description: "支持城市到国家尺度分块、断点续传和拼接的多源 DEM 下载器"
+  default_prompt: "使用 $download-dem 规划并下载指定区域的 DEM；根据面积自动选择窗口拼接或可续传原始瓦片。"
