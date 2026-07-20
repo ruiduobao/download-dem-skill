@@ -62,8 +62,8 @@ SOURCES: dict[str, dict[str, Any]] = {
             "SRTMGL3", "SRTMGL1", "SRTMGL1_E", "AW3D30", "AW3D30_E",
             "SRTM15Plus", "NASADEM", "COP30", "COP90", "EU_DTM",
         ],
-        "credentials": "OPENTOPOGRAPHY_API_KEY required",
-        "coverage": "Dataset-specific",
+        "credentials": "Optional: OPENTOPOGRAPHY_API_KEY. Without it, requests auto-fall back to Microsoft Planetary Computer Copernicus DEM.",
+        "coverage": "Dataset-specific; falls back to global Copernicus DEM without a key",
         "native_tiles": False,
     },
     "usgs": {
@@ -74,8 +74,8 @@ SOURCES: dict[str, dict[str, Any]] = {
     },
     "earthdata": {
         "datasets": ["aster-gdem-v3"],
-        "credentials": "EARTHDATA_TOKEN required for protected LP DAAC assets",
-        "coverage": "ASTER GDEM V3 coverage, approximately 83 degrees north to 83 degrees south",
+        "credentials": "Optional: EARTHDATA_TOKEN. Without it, requests auto-fall back to Microsoft Planetary Computer Copernicus DEM.",
+        "coverage": "ASTER GDEM V3 coverage, approximately 83 degrees north to 83 degrees south; falls back to global Copernicus DEM without a token",
         "native_tiles": True,
     },
 }
@@ -298,17 +298,46 @@ def resolve_aoi(args: argparse.Namespace) -> tuple[tuple[float, float, float, fl
     raise DemError("provide --bbox west south east north or --aoi PATH")
 
 
-def select_source(source: str, dataset: str | None, resolution: float | None, bbox: Sequence[float]) -> tuple[str, str]:
+def select_source(source: str, dataset: str | None, resolution: float | None, bbox: Sequence[float]) -> tuple[str, str, dict[str, Any] | None]:
+    """Pick (source, dataset, fallback_note).
+
+    When the caller asks for ``opentopography`` or ``earthdata`` without the
+    matching credential in the environment, transparently downgrade to the
+    public Microsoft Planetary Computer Copernicus DEM so the skill remains
+    usable out of the box. ``fallback_note`` is a small dict describing the
+    substitution so ``plan`` and ``download`` can surface it to the user.
+    """
     requested_dataset = canonical_dataset(dataset)
+    fallback: dict[str, Any] | None = None
+    if source == "opentopography" and not os.environ.get("OPENTOPOGRAPHY_API_KEY"):
+        fallback = {
+            "from_source": "opentopography",
+            "to_source": "mpc",
+            "to_dataset": "cop-dem-glo-90" if resolution and resolution >= 90 else "cop-dem-glo-30",
+            "reason": "OPENTOPOGRAPHY_API_KEY not set; auto-falling back to Microsoft Planetary Computer Copernicus DEM",
+        }
+        source = "mpc"
+        # Always switch to a Copernicus dataset on fallback, even if the
+        # caller passed an OpenTopography-specific name like SRTMGL1.
+        requested_dataset = fallback["to_dataset"]
+    elif source == "earthdata" and not os.environ.get("EARTHDATA_TOKEN"):
+        fallback = {
+            "from_source": "earthdata",
+            "to_source": "mpc",
+            "to_dataset": "cop-dem-glo-90" if resolution and resolution >= 90 else "cop-dem-glo-30",
+            "reason": "EARTHDATA_TOKEN not set; auto-falling back to Microsoft Planetary Computer Copernicus DEM",
+        }
+        source = "mpc"
+        requested_dataset = fallback["to_dataset"]
     if source == "auto":
         if requested_dataset:
             candidates = [name for name, info in SOURCES.items() if requested_dataset in info["datasets"]]
             if not candidates:
                 raise DemError(f"no source supports dataset {requested_dataset!r}")
-            preferred = ["mpc", "opentopography", "earthdata", "usgs", "aws"]
+            preferred = ["mpc", "usgs", "aws", "opentopography", "earthdata"]
             selected_source = next(name for name in preferred if name in candidates)
             return select_source(selected_source, requested_dataset, resolution, bbox)
-        return "mpc", "cop-dem-glo-90" if resolution and resolution >= 90 else "cop-dem-glo-30"
+        return "mpc", ("cop-dem-glo-90" if resolution and resolution >= 90 else "cop-dem-glo-30"), None
     if source in ("mpc", "aws"):
         selected = requested_dataset or ("cop-dem-glo-90" if resolution and resolution >= 90 else "cop-dem-glo-30")
     elif source == "opentopography":
@@ -326,7 +355,7 @@ def select_source(source: str, dataset: str | None, resolution: float | None, bb
         raise DemError(f"unknown source: {source}")
     if selected not in SOURCES[source]["datasets"]:
         raise DemError(f"dataset {selected!r} is not supported by source {source!r}")
-    return source, selected
+    return source, selected, fallback
 
 
 def estimate_pixels(bbox: Sequence[float], dataset: str) -> int | None:
@@ -1066,9 +1095,20 @@ def validate_dem(path: Path, requested_bbox: Sequence[float] | None = None) -> d
     except ImportError as exc:
         raise _dependency_error("raster", exc) from exc
 
+    path = Path(path)
+    if not path.exists():
+        raise DemError(f"file not found: {path}")
+    if not path.is_file():
+        raise DemError(f"not a regular file: {path}")
+
+    try:
+        dataset = rasterio.open(path)
+    except Exception as exc:
+        raise DemError(f"cannot open raster {path}: {safe_error(exc)}") from exc
+
     failures = []
     warnings = []
-    with rasterio.open(path) as dataset:
+    with dataset:
         if dataset.crs is None:
             failures.append("missing CRS")
         if dataset.width <= 0 or dataset.height <= 0 or dataset.count <= 0:
@@ -1301,7 +1341,7 @@ def cmd_sources(_: argparse.Namespace) -> int:
 
 def _plan_payload(args: argparse.Namespace) -> dict[str, Any]:
     bbox, geometries = resolve_aoi(args)
-    source, dataset = select_source(args.source, args.dataset, args.resolution, bbox)
+    source, dataset, fallback = select_source(args.source, args.dataset, args.resolution, bbox)
     pixels = estimate_pixels(bbox, dataset)
     area, area_method = aoi_area_km2(bbox, geometries)
     mode, mode_reason = choose_output_mode(
@@ -1312,9 +1352,29 @@ def _plan_payload(args: argparse.Namespace) -> dict[str, Any]:
         args.max_pixels,
     )
     estimated_assets = estimate_asset_count(source, dataset, bbox, args.chunk_degrees)
+    warnings: list[str] = []
+    allow_large = bool(getattr(args, "allow_large", False))
+    if mode == "mosaic" and (
+        area > args.mosaic_max_area_km2 or (pixels is not None and pixels > args.max_pixels)
+    ):
+        if allow_large:
+            warnings.append(
+                "mosaic size exceeds default thresholds; --allow-large acknowledges the extra resource cost"
+            )
+        else:
+            warnings.append(
+                "mosaic size exceeds default thresholds; pass --allow-large to actually run this job"
+            )
+    if fallback:
+        warnings.append(fallback["reason"])
     return {
         "source": source,
         "dataset": dataset,
+        "requested_source": fallback["from_source"] if fallback else source,
+        "requested_dataset": (
+            dataset if not fallback else None
+        ),
+        "credential_fallback": fallback,
         "bbox_wgs84": list(bbox),
         "aoi_area_km2": round(area, 3),
         "area_method": area_method,
@@ -1324,6 +1384,8 @@ def _plan_payload(args: argparse.Namespace) -> dict[str, Any]:
         "requested_mode": args.mode,
         "selected_mode": mode,
         "mode_reason": mode_reason,
+        "allow_large_acknowledged": allow_large,
+        "warnings": warnings,
         "mosaic_max_area_km2": args.mosaic_max_area_km2,
         "max_pixels": args.max_pixels,
         **DATASETS.get(dataset, {}),
@@ -1341,7 +1403,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_download(args: argparse.Namespace) -> int:
     bbox, geometries = resolve_aoi(args)
     requested_source = args.source
-    source, dataset = select_source(requested_source, args.dataset, args.resolution, bbox)
+    source, dataset, fallback = select_source(requested_source, args.dataset, args.resolution, bbox)
+    if fallback:
+        emit_event("credential_fallback", **fallback)
     pixels = estimate_pixels(bbox, dataset)
     area, area_method = aoi_area_km2(bbox, geometries)
     mode, mode_reason = choose_output_mode(
@@ -1360,7 +1424,7 @@ def cmd_download(args: argparse.Namespace) -> int:
 
     attempts = []
     candidate_sources = [source]
-    if requested_source == "auto" and source == "mpc" and dataset in SOURCES["aws"]["datasets"]:
+    if (requested_source == "auto" or fallback) and source == "mpc" and dataset in SOURCES["aws"]["datasets"]:
         candidate_sources.append("aws")
     final_error = None
     for candidate in candidate_sources:
@@ -1397,6 +1461,8 @@ def cmd_download(args: argparse.Namespace) -> int:
         "created_at": utc_now(),
         "source": source,
         "dataset": dataset,
+        "requested_source": fallback["from_source"] if fallback else source,
+        "credential_fallback": fallback,
         "mode": mode,
         "mode_reason": mode_reason,
         "bbox_wgs84": list(bbox),
@@ -1450,6 +1516,8 @@ def add_planning_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mosaic-max-area-km2", type=float, default=DEFAULT_MOSAIC_MAX_AREA_KM2)
     parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
     parser.add_argument("--chunk-degrees", type=float, default=DEFAULT_CHUNK_DEGREES)
+    parser.add_argument("--allow-large", action="store_true",
+                        help="Acknowledge oversized mosaic (plan: reports the constraint, download: bypasses it)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1475,7 +1543,6 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--max-assets", type=int, default=DEFAULT_MAX_ASSETS)
     download_parser.add_argument("--max-asset-gb", type=float, default=DEFAULT_MAX_ASSET_BYTES / 1_000_000_000)
     download_parser.add_argument("--allow-many-assets", action="store_true")
-    download_parser.add_argument("--allow-large", action="store_true")
     download_parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     download_parser.add_argument("--verify-existing", action="store_true", help="Hash completed assets before skipping")
     download_parser.add_argument("--stage-assets", action="store_true", help="Download assets before mosaicking")
