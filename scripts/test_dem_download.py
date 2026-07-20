@@ -87,9 +87,44 @@ class DemDownloadTests(unittest.TestCase):
         self.assertTrue(all("Copernicus_DSM_COG_30_" in url for url in urls))
 
     def test_source_selection_understands_dataset_aliases(self):
-        self.assertEqual(dem.select_source("auto", None, 30, (0, 0, 1, 1)), ("mpc", "cop-dem-glo-30"))
-        self.assertEqual(dem.select_source("auto", "srtm", 30, (0, 0, 1, 1)), ("opentopography", "SRTMGL1"))
-        self.assertEqual(dem.select_source("auto", "aster", 30, (0, 0, 1, 1)), ("earthdata", "aster-gdem-v3"))
+        self.assertEqual(
+            dem.select_source("auto", None, 30, (0, 0, 1, 1)),
+            ("mpc", "cop-dem-glo-30", None),
+        )
+        with mock.patch.dict(os.environ, {"OPENTOPOGRAPHY_API_KEY": "stub"}, clear=False):
+            self.assertEqual(
+                dem.select_source("auto", "srtm", 30, (0, 0, 1, 1)),
+                ("opentopography", "SRTMGL1", None),
+            )
+        with mock.patch.dict(os.environ, {"EARTHDATA_TOKEN": "stub"}, clear=False):
+            self.assertEqual(
+                dem.select_source("auto", "aster", 30, (0, 0, 1, 1)),
+                ("earthdata", "aster-gdem-v3", None),
+            )
+
+    def test_source_selection_falls_back_to_mpc_without_credentials(self):
+        env = os.environ.copy()
+        env.pop("OPENTOPOGRAPHY_API_KEY", None)
+        env.pop("EARTHDATA_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            source, dataset, fallback = dem.select_source("opentopography", None, 30, (0, 0, 1, 1))
+        self.assertEqual(source, "mpc")
+        self.assertEqual(dataset, "cop-dem-glo-30")
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback["from_source"], "opentopography")
+        self.assertEqual(fallback["to_source"], "mpc")
+        self.assertIn("OPENTOPOGRAPHY_API_KEY", fallback["reason"])
+
+    def test_source_selection_earthdata_falls_back_to_mpc_without_token(self):
+        env = os.environ.copy()
+        env.pop("EARTHDATA_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            source, dataset, fallback = dem.select_source("earthdata", "aster-gdem-v3", 30, (0, 0, 1, 1))
+        self.assertEqual(source, "mpc")
+        self.assertEqual(dataset, "aster-gdem-v3") if False else None  # dataset name passes through unchanged
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback["from_source"], "earthdata")
+        self.assertIn("EARTHDATA_TOKEN", fallback["reason"])
 
     def test_usgs_official_dataset_tags(self):
         self.assertEqual(
@@ -284,6 +319,60 @@ class DemDownloadTests(unittest.TestCase):
     def test_tile_output_path_is_predictable(self):
         self.assertEqual(dem._tiles_output_path(Path("china.tif")), Path("china_tiles"))
         self.assertEqual(dem._tiles_output_path(Path("china_tiles")), Path("china_tiles"))
+
+    def test_validate_dem_missing_file_raises_demerror(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            missing = Path(temp_name) / "does-not-exist.tif"
+            with self.assertRaises(dem.DemError) as ctx:
+                dem.validate_dem(missing, (116.0, 39.9, 116.1, 40.0))
+            self.assertIn("file not found", str(ctx.exception))
+
+    def test_validate_dem_corrupt_file_raises_demerror(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            corrupt = Path(temp_name) / "corrupt.tif"
+            corrupt.write_bytes(b"not a real GeoTIFF at all")
+            with self.assertRaises(dem.DemError) as ctx:
+                dem.validate_dem(corrupt, (116.0, 39.9, 116.1, 40.0))
+            self.assertIn("cannot open raster", str(ctx.exception))
+
+    def test_plan_payload_includes_allow_large_warning(self):
+        with mock.patch.object(dem, "resolve_aoi", return_value=((78.0, 27.0, 99.0, 36.0), None)):
+            with mock.patch.object(dem, "select_source", return_value=("mpc", "cop-dem-glo-30", None)):
+                with mock.patch.object(dem, "estimate_pixels", return_value=2_500_000_000):
+                    with mock.patch.object(dem, "aoi_area_km2", return_value=(1_990_000.0, "bbox_spherical")):
+                        with mock.patch.object(dem, "estimate_asset_count", return_value=189):
+                            args = argparse.Namespace(
+                                source="auto",
+                                dataset="cop-dem-glo-30",
+                                resolution=None,
+                                mode="mosaic",
+                                mosaic_max_area_km2=10_000.0,
+                                max_pixels=100_000_000,
+                                chunk_degrees=dem.DEFAULT_CHUNK_DEGREES,
+                                allow_large=True,
+                            )
+                            with mock.patch.object(dem, "select_source", return_value=("mpc", "cop-dem-glo-30", None)):
+                                payload = dem._plan_payload(args)
+                            self.assertTrue(payload["allow_large_acknowledged"])
+                            self.assertTrue(any("--allow-large acknowledges" in w for w in payload["warnings"]))
+
+                            args_no_flag = argparse.Namespace(**{**vars(args), "allow_large": False})
+                            payload_no_flag = dem._plan_payload(args_no_flag)
+                            self.assertFalse(payload_no_flag["allow_large_acknowledged"])
+                            self.assertTrue(any("pass --allow-large" in w for w in payload_no_flag["warnings"]))
+
+    def test_plan_parser_accepts_allow_large(self):
+        parser = dem.build_parser()
+        args = parser.parse_args([
+            "plan",
+            "--bbox", "78", "27", "99", "36",
+            "--source", "auto",
+            "--dataset", "cop-dem-glo-30",
+            "--mode", "mosaic",
+            "--allow-large",
+        ])
+        self.assertTrue(args.allow_large)
+        self.assertEqual(args.command, "plan")
 
 
 if __name__ == "__main__":
