@@ -1,6 +1,5 @@
 import argparse
 import hashlib
-import importlib.util
 import io
 import json
 import math
@@ -15,12 +14,10 @@ from pathlib import Path
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).with_name("dem_download.py")
-SPEC = importlib.util.spec_from_file_location("dem_download", MODULE_PATH)
-dem = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules[SPEC.name] = dem
-SPEC.loader.exec_module(dem)
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import dem_download as dem  # noqa: E402  (intentional import-after-sys.path mutation)
 
 
 class RangeHandler(BaseHTTPRequestHandler):
@@ -305,13 +302,12 @@ class DemDownloadTests(unittest.TestCase):
             },
         ]
         args = argparse.Namespace(
-            earthdata_token_env="TEST_EARTHDATA_TOKEN",
             timeout=10,
             retries=0,
             max_assets=10,
             allow_many_assets=False,
         )
-        with mock.patch.dict(os.environ, {"TEST_EARTHDATA_TOKEN": "secret"}, clear=False):
+        with mock.patch.dict(os.environ, {"EARTHDATA_TOKEN": "secret"}, clear=False):
             with mock.patch.object(dem, "_get_json", side_effect=[{"feed": {"entry": entries}}]):
                 assets = dem.discover_earthdata_assets((121.1, 30.1, 121.2, 30.2), "aster-gdem-v3", args)
         self.assertEqual([asset.id for asset in assets], ["inside"])
