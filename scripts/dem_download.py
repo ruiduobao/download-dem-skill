@@ -147,6 +147,15 @@ EARTHDATA_DATASETS = {
     "aster-gdem-v3": {"short_name": "ASTGTM", "version": "003"},
 }
 
+# Hard-coded allowlist of environment variables this skill reads for credentials.
+# Adding a new provider requires extending this list explicitly; arbitrary
+# environment variable names are not honoured. This keeps the skill from being
+# used as a generic environment-secret access primitive.
+ALLOWED_CREDENTIAL_ENV_VARS: dict[str, str] = {
+    "opentopography": "OPENTOPOGRAPHY_API_KEY",
+    "earthdata": "EARTHDATA_TOKEN",
+}
+
 
 class DemError(RuntimeError):
     pass
@@ -813,9 +822,9 @@ def discover_opentopography_assets(
     dataset: str,
     args: argparse.Namespace,
 ) -> list[Asset]:
-    api_key = os.environ.get(args.api_key_env)
+    api_key = os.environ.get(ALLOWED_CREDENTIAL_ENV_VARS["opentopography"])
     if not api_key:
-        raise DemError(f"set {args.api_key_env} before using OpenTopography")
+        raise DemError(f"set {ALLOWED_CREDENTIAL_ENV_VARS['opentopography']} before using OpenTopography")
     assets = []
     for index, chunk in enumerate(split_bbox(bbox, args.chunk_degrees)):
         west, south, east, north = chunk
@@ -910,9 +919,9 @@ def _select_cmr_dem_link(entry: dict[str, Any]) -> str | None:
 
 
 def discover_earthdata_assets(bbox: Sequence[float], dataset: str, args: argparse.Namespace) -> list[Asset]:
-    token = os.environ.get(args.earthdata_token_env)
+    token = os.environ.get(ALLOWED_CREDENTIAL_ENV_VARS["earthdata"])
     if not token:
-        raise DemError(f"set {args.earthdata_token_env} before downloading ASTER GDEM V3")
+        raise DemError(f"set {ALLOWED_CREDENTIAL_ENV_VARS['earthdata']} before downloading ASTER GDEM V3")
     config = EARTHDATA_DATASETS[dataset]
     page_num = 1
     assets = []
@@ -1848,8 +1857,6 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser = subparsers.add_parser("download", help="Download a resumable tile set or windowed DEM mosaic")
     add_planning_arguments(download_parser, include_admin=True)
     download_parser.add_argument("--output", required=True, help="GeoTIFF for mosaic mode or directory for tile mode")
-    download_parser.add_argument("--api-key-env", default="OPENTOPOGRAPHY_API_KEY")
-    download_parser.add_argument("--earthdata-token-env", default="EARTHDATA_TOKEN")
     download_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     download_parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     download_parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
