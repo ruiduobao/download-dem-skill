@@ -200,6 +200,19 @@ When `--stage-assets` is used in mosaic mode (with or without `--keep-cache`), t
 - Preserve native values. Do not fill voids, smooth, resample, or derive terrain products unless requested and recorded. 保留原始值；除非用户要求并记录，否则不填洞、不平滑、不重采样，也不派生地形产品。
 - Verify current license and attribution before publication, redistribution, or commercial use. 发布、再分发或商业使用前核验最新许可和署名要求。
 
+## Permissions / 权限声明
+
+The skill requires the following capabilities. None of them are hidden; all are documented up-front so reviewers, hosts, and end users can grant informed consent.
+
+技能需要以下能力。能力均已显式声明，便于审核者、宿主和用户知情授权。
+
+| Capability / 能力 | Purpose / 用途 | Scope / 范围 |
+| --- | --- | --- |
+| **Network egress (HTTPS)** | Query Microsoft Planetary Computer STAC, AWS Open Data, USGS TNM Access, NASA Earthdata CMR, OpenTopography Global DEM, and `map.ruiduobao.com` (Chinese administrative divisions). | Only the provider hostnames listed above; no telemetry, no third-party analytics, no auto-update calls. 仅限以上数据源域名；不发送任何遥测、第三方分析或自动更新请求。 |
+| **Environment variable read** | Read two specific credential variables when the matching provider is requested: `OPENTOPOGRAPHY_API_KEY` (for OpenTopography) and `EARTHDATA_TOKEN` (for NASA Earthdata). The variable names are hard-coded in `ALLOWED_CREDENTIAL_ENV_VARS`; no other environment variable is read for credential purposes. | Only those two names, only when the matching `--source` is selected. The skill does not enumerate, list, or forward any other environment variable. 仅读取上述两个变量名，仅在选择对应 `--source` 时读取；不枚举、列举或转发任何其他环境变量。 |
+| **Local file read** | Read the user-supplied `--aoi vector.geojson` if provided, plus the Python source files of the skill itself. | User-supplied path only; no scanning of the host filesystem. 仅读取用户提供的路径，不扫描宿主文件系统。 |
+| **Local file write** | Write the user-supplied `--output` GeoTIFF, the matching `manifest.json` sidecar, optional `.<output>.parts/<source>/` hidden staging cache, `<output>_tiles/<source>/` tile directory, and temporary scratch files inside `--output`'s parent. | Only paths derived from `--output` and (when applicable) `--admin`; never writes outside the user's chosen output location. 仅在 `--output`（及可选 `--admin`）派生的路径下写入；绝不写到用户选定输出位置之外。 |
+
 ## Dependencies / 依赖
 
 Require Python 3.10+ and `rasterio`; vector AOIs require `fiona`; MPC requires `pystac-client` and `planetary-computer`. Other providers use the Python standard library. Do not install missing packages without user authorization.
