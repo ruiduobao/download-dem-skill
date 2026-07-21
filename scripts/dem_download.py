@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ MPC_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
 OPENTOPOGRAPHY_API = "https://portal.opentopography.org/API/globaldem"
 USGS_PRODUCTS_API = "https://tnmaccess.nationalmap.gov/api/v1/products"
 EARTHDATA_CMR_GRANULES = "https://cmr.earthdata.nasa.gov/search/granules.json"
+RUIDUOBAO_API = "https://map.ruiduobao.com"
 USER_AGENT = "download-dem-skill/2.0"
 
 DEFAULT_MAX_PIXELS = 100_000_000
@@ -291,11 +293,307 @@ def _load_aoi(path: str | Path) -> tuple[tuple[float, float, float, float], list
 
 
 def resolve_aoi(args: argparse.Namespace) -> tuple[tuple[float, float, float, float], list[dict[str, Any]] | None]:
+    if getattr(args, "admin", None):
+        result = resolve_admin(
+            name=getattr(args, "admin", None),
+            code=getattr(args, "admin_code", None),
+            province=getattr(args, "admin_province", None),
+            city=getattr(args, "admin_city", None),
+            level=getattr(args, "admin_level", None) or "xian",
+            year=int(getattr(args, "admin_year", None) or 2023),
+            expand_km=float(getattr(args, "admin_expand_km", None) or 1.0),
+        )
+        admin_meta = {k: v for k, v in result.items() if k not in {"bbox_wgs84_expanded"}}
+        setattr(args, "admin_metadata", admin_meta)
+        return result["bbox_wgs84_expanded"], None
     if getattr(args, "bbox", None):
         return normalize_bbox(args.bbox), None
     if getattr(args, "aoi", None):
         return _load_aoi(args.aoi)
-    raise DemError("provide --bbox west south east north or --aoi PATH")
+    raise DemError("provide --admin NAME, --bbox west south east north, or --aoi PATH")
+
+
+# ---------------------------------------------------------------------------
+# China administrative-divisions helper (map.ruiduobao.com)
+# ---------------------------------------------------------------------------
+ADMIN_LEVEL_ALIASES = {
+    "province": "sheng", "省": "sheng", "sheng": "sheng",
+    "city": "shi", "市": "shi", "shi": "shi", "prefecture": "shi", "prefecture-level city": "shi",
+    "county": "xian", "区": "xian", "县": "xian", "xian": "xian", "district": "xian",
+    "town": "xiang", "township": "xiang", "镇": "xiang", "乡": "xiang", "xiang": "xiang",
+    "village": "cun", "村": "cun", "cun": "cun",
+}
+ADMIN_LEVEL_LABELS = {
+    "sheng": "province", "shi": "prefecture-level city", "xian": "county/district",
+    "xiang": "town/township", "cun": "village",
+}
+
+
+def _normalize_admin_level(value: str | None, default: str = "xian") -> str:
+    if not value:
+        return default
+    key = value.strip().lower()
+    if key not in ADMIN_LEVEL_ALIASES:
+        valid = ", ".join(sorted({*ADMIN_LEVEL_ALIASES}))
+        raise DemError(f"unknown admin level {value!r}; expected one of: {valid}")
+    return ADMIN_LEVEL_ALIASES[key]
+
+
+def _bbox_of_geometry(geometry: dict[str, Any] | None) -> tuple[float, float, float, float] | None:
+    if not geometry:
+        return None
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if gtype is None or coords is None:
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, (list, tuple)) and node and isinstance(node[0], (int, float)):
+            xs.append(float(node[0]))
+            ys.append(float(node[1]))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    if gtype == "Polygon":
+        for ring in coords:
+            walk(ring)
+    elif gtype == "MultiPolygon":
+        for polygon in coords:
+            for ring in polygon:
+                walk(ring)
+    else:
+        return None
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bbox_of_geojson(geojson: dict[str, Any]) -> tuple[float, float, float, float]:
+    xs: list[float] = []
+    ys: list[float] = []
+    if isinstance(geojson, dict) and geojson.get("type") == "FeatureCollection":
+        for feature in geojson.get("features") or []:
+            feature_bbox = _bbox_of_geometry((feature or {}).get("geometry"))
+            if feature_bbox:
+                xs.extend([feature_bbox[0], feature_bbox[2]])
+                ys.extend([feature_bbox[1], feature_bbox[3]])
+    else:
+        direct = _bbox_of_geometry(geojson)
+        if direct:
+            xs.extend([direct[0], direct[2]])
+            ys.extend([direct[1], direct[3]])
+    if not xs:
+        raise DemError("GeoJSON had no geometry coordinates; nothing to bound")
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def expand_bbox_km(bbox: Sequence[float], expand_km: float) -> tuple[float, float, float, float]:
+    """Expand a WGS84 bbox by ``expand_km`` kilometres on every side.
+
+    Uses a flat-earth approximation: 1° latitude is 110.574 km; 1° longitude
+    is 111.320 km * cos(mid-latitude). The helper is symmetric — the same
+    buffer is added to all four sides — and clips to the legitimate
+    longitude/latitude range so the result is always a valid bbox.
+    """
+    if expand_km < 0:
+        raise DemError("expand_km must be non-negative")
+    west, south, east, north = normalize_bbox(bbox)
+    if expand_km == 0:
+        return west, south, east, north
+    lat_buffer = expand_km / 110.574
+    mid_lat = (south + north) / 2
+    lon_factor = max(0.01, math.cos(math.radians(mid_lat)))
+    lon_buffer = expand_km / (111.320 * lon_factor)
+    new_w = max(-180.0, west - lon_buffer)
+    new_e = min(180.0, east + lon_buffer)
+    new_s = max(-90.0, south - lat_buffer)
+    new_n = min(90.0, north + lat_buffer)
+    return new_w, new_s, new_e, new_n
+
+
+def _ruiduobao_request(url: str, params: dict[str, Any] | None = None,
+                       headers: dict[str, str] | None = None,
+                       timeout: int = DEFAULT_TIMEOUT_SECONDS,
+                       retries: int = DEFAULT_RETRIES,
+                       stream: bool = False) -> urllib.request.addinfourl:
+    """Issue a request to map.ruiduobao.com, bypassing HTTP(S) proxy by default.
+
+    The host is in China and frequently unreachable through VPNs. Callers can
+    force proxy use by setting ``RUIDUOBAO_USE_PROXY=1``.
+    """
+    full_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
+    request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json", **(headers or {})}
+    request = urllib.request.Request(full_url, headers=request_headers)
+    last_exc: BaseException | None = None
+    for attempt in range(retries + 1):
+        proxy_override = os.environ.get("RUIDUOBAO_USE_PROXY", "").strip().lower() in {"1", "true", "yes"}
+        opener_args: dict[str, Any] = {"timeout": timeout}
+        if proxy_override:
+            # fall through to system proxy handling
+            pass
+        else:
+            opener_args["context"] = _no_proxy_ssl_context()
+        try:
+            return urllib.request.urlopen(request, **opener_args)
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code in (408, 429, 500, 502, 503, 504)
+            if not retryable or attempt >= retries:
+                body = exc.read(1000).decode("utf-8", errors="replace")
+                raise DemError(f"map.ruiduobao.com returned HTTP {exc.code}: {safe_error(body)}") from exc
+            last_exc = exc
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            if attempt >= retries:
+                raise DemError(f"map.ruiduobao.com request failed after {retries + 1} attempts: {safe_error(exc)}") from exc
+            last_exc = exc
+        time.sleep(min(30, 2**attempt))
+    raise DemError(f"map.ruiduobao.com request failed: {safe_error(last_exc) if last_exc else 'unknown'}")
+
+
+def _no_proxy_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that bypasses HTTP(S) proxy environment variables.
+
+    urllib builds its proxy from ``http_proxy`` / ``https_proxy`` /
+    ``HTTP_PROXY`` / ``HTTPS_PROXY`` and ``REQUEST_METHOD`` defaults. Using a
+    custom SSL context disables the auto-detected proxy when no explicit proxy
+    handler is installed. We also ensure the hostname check stays on.
+    """
+    return ssl.create_default_context()
+
+
+def _ruiduobao_search(keyword: str, province: str | None = None,
+                      level: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """Call /search and parse the SSE stream into a list of result dicts."""
+    params: dict[str, Any] = {"keyword": keyword, "limit": str(limit)}
+    if province:
+        params["province"] = province
+    response = _ruiduobao_request(f"{RUIDUOBAO_API}/search", params=params,
+                                  headers={"Accept": "text/event-stream"})
+    raw = response.read().decode("utf-8", errors="replace")
+    results: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result" and isinstance(event.get("data"), dict):
+            data = dict(event["data"])
+            data["_scope"] = event.get("scope")
+            results.append(data)
+    if level:
+        results = [item for item in results if item.get("level") == level]
+    return results
+
+
+def _ruiduobao_geojson_for_code(code: str, year: int) -> dict[str, Any]:
+    response = _ruiduobao_request(f"{RUIDUOBAO_API}/getGsonDB", params={"code": code, "year": year})
+    payload = json.load(response)
+    if payload.get("status") != "success":
+        raise DemError(f"map.ruiduobao.com could not load admin {code}: {payload.get('message', 'unknown error')}")
+    relative = payload.get("filepath")
+    if not relative:
+        raise DemError(f"map.ruiduobao.com returned no filepath for admin {code}")
+    file_url = f"{RUIDUOBAO_API}{relative}" if relative.startswith("/") else f"{RUIDUOBAO_API}/{relative}"
+    geo_response = _ruiduobao_request(file_url)
+    return json.load(geo_response)
+
+
+def _pick_admin_result(results: list[dict[str, Any]], name: str, province: str | None,
+                       city: str | None, level: str) -> dict[str, Any]:
+    if not results:
+        context = []
+        if province:
+            context.append(f"province={province}")
+        if city:
+            context.append(f"city={city}")
+        ctx = f" ({', '.join(context)})" if context else ""
+        raise DemError(f"no administrative division matched {name!r} at level {level}{ctx}")
+
+    def score(item: dict[str, Any]) -> tuple[int, int, int]:
+        s = 0
+        if province and item.get("province_name") == province:
+            s += 100
+        if city and item.get("city_name") == city:
+            s += 50
+        if item.get("name") == name:
+            s += 10
+        scope_bonus = 5 if item.get("_scope") == "province" else 0
+        return (s, scope_bonus, 0)
+
+    ranked = sorted(results, key=score, reverse=True)
+    return ranked[0]
+
+
+def resolve_admin(name: str | None, code: str | None, province: str | None = None,
+                  city: str | None = None, level: str = "xian", year: int = 2023,
+                  expand_km: float = 1.0) -> dict[str, Any]:
+    """Resolve an administrative-division name (or code) to an expanded bbox.
+
+    Returns a dict with: ``name``, ``code``, ``level`` (english label),
+    ``admin_level_code`` (sheng/shi/xian/xiang/cun), ``province``,
+    ``city`` (when known), ``bbox_wgs84`` (raw geometry bbox),
+    ``bbox_wgs84_expanded`` (bbox padded by ``expand_km`` on every side),
+    ``expand_km``, ``area_km2`` (raw geometry area via ``bbox_area_km2``),
+    ``area_km2_expanded`` (expanded bbox area), and ``source``
+    (``map.ruiduobao.com``).
+    """
+    if not name and not code:
+        raise DemError("provide --admin NAME or --admin-code CODE")
+    level_code = _normalize_admin_level(level)
+    chosen: dict[str, Any]
+    if code:
+        chosen = {"name": name or code, "code": code, "level": level_code,
+                  "province_name": province, "city_name": city}
+    else:
+        results = _ruiduobao_search(name, province=province, level=level_code, limit=20)
+        chosen = _pick_admin_result(results, name, province, city, level_code)
+    geojson = _ruiduobao_geojson_for_code(chosen["code"], year)
+    raw_bbox = _bbox_of_geojson(geojson)
+    expanded = expand_bbox_km(raw_bbox, expand_km)
+    return {
+        "name": chosen.get("name"),
+        "code": chosen.get("code"),
+        "level": ADMIN_LEVEL_LABELS.get(chosen["level"], chosen["level"]),
+        "admin_level_code": chosen["level"],
+        "province": chosen.get("province_name"),
+        "city": chosen.get("city_name"),
+        "year": year,
+        "source": "map.ruiduobao.com",
+        "bbox_wgs84": list(raw_bbox),
+        "bbox_wgs84_expanded": list(expanded),
+        "expand_km": expand_km,
+        "area_km2": round(bbox_area_km2(raw_bbox), 3),
+        "area_km2_expanded": round(bbox_area_km2(expanded), 3),
+    }
+
+
+def cmd_admin_bbox(args: argparse.Namespace) -> int:
+    name = getattr(args, "name", None)
+    code = getattr(args, "code", None)
+    if not name and not code:
+        raise DemError("provide --name NAME or --code CODE")
+    level = _normalize_admin_level(getattr(args, "level", None) or "xian")
+    year = int(getattr(args, "year", None) or 2023)
+    expand_km = float(getattr(args, "expand_km", None) or 1.0)
+    result = resolve_admin(
+        name=name,
+        code=code,
+        province=getattr(args, "province", None),
+        city=getattr(args, "city", None),
+        level=level,
+        year=year,
+        expand_km=expand_km,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def select_source(source: str, dataset: str | None, resolution: float | None, bbox: Sequence[float]) -> tuple[str, str, dict[str, Any] | None]:
@@ -1501,14 +1799,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if report["status"] != "fail" else 2
 
 
-def add_aoi_arguments(parser: argparse.ArgumentParser) -> None:
+def add_aoi_arguments(parser: argparse.ArgumentParser, *, include_admin: bool = False) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
-    group.add_argument("--aoi", help="Vector AOI readable by Fiona")
+    if include_admin:
+        group.add_argument("--admin", help="Chinese administrative-division name; resolved via map.ruiduobao.com")
+        group.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+        group.add_argument("--aoi", help="Vector AOI readable by Fiona")
+        admin_group = parser.add_argument_group("admin AOI options",
+                                                "Optional refinement for --admin; ignored otherwise")
+        admin_group.add_argument("--admin-code", help="Use a known 6/12-digit code instead of searching by name")
+        admin_group.add_argument("--admin-province", help="Province name to disambiguate (e.g. '四川省')")
+        admin_group.add_argument("--admin-city", help="Prefecture-level city to disambiguate (e.g. '成都市')")
+        admin_group.add_argument("--admin-level", default="xian",
+                                 help="Administrative level: sheng/province, shi/city, xian/county, xiang/town, cun/village (default xian)")
+        admin_group.add_argument("--admin-year", type=int, default=2023,
+                                 help="Year of the administrative vector (default 2023)")
+        admin_group.add_argument("--admin-expand-km", type=float, default=1.0,
+                                 help="Pad the raw admin bbox by N kilometres on every side (default 1)")
+    else:
+        group.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+        group.add_argument("--aoi", help="Vector AOI readable by Fiona")
 
 
-def add_planning_arguments(parser: argparse.ArgumentParser) -> None:
-    add_aoi_arguments(parser)
+def add_planning_arguments(parser: argparse.ArgumentParser, *, include_admin: bool = False) -> None:
+    add_aoi_arguments(parser, include_admin=include_admin)
     parser.add_argument("--source", choices=["auto", *SOURCES], default="auto")
     parser.add_argument("--dataset")
     parser.add_argument("--resolution", type=float, help="Desired nominal resolution in metres")
@@ -1528,11 +1842,11 @@ def build_parser() -> argparse.ArgumentParser:
     sources_parser.set_defaults(func=cmd_sources)
 
     plan_parser = subparsers.add_parser("plan", help="Choose a provider, output mode, and resource strategy")
-    add_planning_arguments(plan_parser)
+    add_planning_arguments(plan_parser, include_admin=True)
     plan_parser.set_defaults(func=cmd_plan)
 
     download_parser = subparsers.add_parser("download", help="Download a resumable tile set or windowed DEM mosaic")
-    add_planning_arguments(download_parser)
+    add_planning_arguments(download_parser, include_admin=True)
     download_parser.add_argument("--output", required=True, help="GeoTIFF for mosaic mode or directory for tile mode")
     download_parser.add_argument("--api-key-env", default="OPENTOPOGRAPHY_API_KEY")
     download_parser.add_argument("--earthdata-token-env", default="EARTHDATA_TOKEN")
@@ -1556,6 +1870,19 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--report", help="Optional JSON report path")
     validate_parser.add_argument("--verify-checksums", action="store_true")
     validate_parser.set_defaults(func=cmd_validate)
+
+    admin_parser = subparsers.add_parser("admin-bbox", help="Resolve a Chinese admin name to a WGS84 bbox (optionally padded by N km)")
+    admin_group = admin_parser.add_mutually_exclusive_group(required=True)
+    admin_group.add_argument("--name", help="Administrative-division name, e.g. '锦江区'")
+    admin_group.add_argument("--code", help="Administrative-division code, e.g. '510104'")
+    admin_parser.add_argument("--province", help="Province to disambiguate (e.g. '四川省')")
+    admin_parser.add_argument("--city", help="Prefecture-level city to disambiguate (e.g. '成都市')")
+    admin_parser.add_argument("--level", default="xian",
+                              help="Admin level: sheng/province, shi/city, xian/county, xiang/town, cun/village (default xian)")
+    admin_parser.add_argument("--year", type=int, default=2023, help="Year of the admin vector (default 2023)")
+    admin_parser.add_argument("--expand-km", type=float, default=1.0,
+                              help="Pad the raw admin bbox by N km on every side (default 1)")
+    admin_parser.set_defaults(func=cmd_admin_bbox)
     return parser
 
 
