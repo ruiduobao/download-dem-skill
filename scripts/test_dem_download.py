@@ -1,7 +1,9 @@
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -373,6 +375,185 @@ class DemDownloadTests(unittest.TestCase):
         ])
         self.assertTrue(args.allow_large)
         self.assertEqual(args.command, "plan")
+
+
+class AdminApiTests(unittest.TestCase):
+    def test_expand_bbox_one_kilometre_is_symmetric(self):
+        west, south, east, north = 104.05775, 30.549384, 104.16833, 30.672644
+        w, s, e, n = dem.expand_bbox_km((west, south, east, north), 1.0)
+        # original side lengths
+        original_width_deg = east - west
+        original_height_deg = north - south
+        # expanded bbox is strictly LARGER on every side (west goes further west, etc.)
+        self.assertLess(w, west)
+        self.assertGreater(e, east)
+        self.assertLess(s, south)
+        self.assertGreater(n, north)
+        # new bbox should be a little larger in both axes
+        self.assertAlmostEqual(e - w, original_width_deg + 2 * (1.0 / (111.320 * math.cos(math.radians((s + n) / 2)))), places=6)
+        self.assertAlmostEqual(n - s, original_height_deg + 2 * (1.0 / 110.574), places=6)
+
+    def test_expand_bbox_zero_is_identity(self):
+        bbox = (104.0, 30.0, 105.0, 31.0)
+        self.assertEqual(dem.expand_bbox_km(bbox, 0.0), bbox)
+
+    def test_expand_bbox_rejects_negative(self):
+        with self.assertRaises(dem.DemError):
+            dem.expand_bbox_km((0, 0, 1, 1), -0.5)
+
+    def test_bbox_of_geojson_polygon(self):
+        geometry = {
+            "type": "Polygon",
+            "coordinates": [[(10, 20), (12, 20), (12, 22), (10, 22), (10, 20)]],
+        }
+        self.assertEqual(dem._bbox_of_geometry(geometry), (10.0, 20.0, 12.0, 22.0))
+
+    def test_bbox_of_geojson_feature_collection(self):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]],
+                    },
+                },
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [
+                            [[(2, 3), (3, 3), (3, 4), (2, 4), (2, 3)]],
+                        ],
+                    },
+                },
+            ],
+        }
+        self.assertEqual(dem._bbox_of_geojson(geojson), (0.0, 0.0, 3.0, 4.0))
+
+    def test_normalize_admin_level_aliases(self):
+        self.assertEqual(dem._normalize_admin_level("省"), "sheng")
+        self.assertEqual(dem._normalize_admin_level("county"), "xian")
+        self.assertEqual(dem._normalize_admin_level("XIANG"), "xiang")
+        self.assertEqual(dem._normalize_admin_level(None), "xian")
+        with self.assertRaises(dem.DemError):
+            dem._normalize_admin_level("planet")
+
+    def test_ruiduobao_search_parses_sse(self):
+        sse = (
+            "data: {\"type\":\"result\",\"data\":{\"name\":\"锦江区\",\"code\":\"510104\",\"level\":\"xian\","
+            "\"province_name\":\"四川省\",\"city_name\":\"成都市\"},\"scope\":\"province\"}\n"
+            "\n"
+            "data: {\"type\":\"provinceDone\",\"hasResults\":true}\n"
+            "data: {\"type\":\"result\",\"data\":{\"name\":\"510104000000\",\"code\":\"510104000000\","
+            "\"level\":\"cun\"},\"scope\":\"province\"}\n"
+            "data: {\"type\":\"done\",\"total\":2}\n"
+        )
+        import io
+        with mock.patch.object(dem, "_ruiduobao_request", return_value=io.BytesIO(sse.encode("utf-8"))):
+            results = dem._ruiduobao_search("锦江区", province="四川省", limit=10)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["code"], "510104")
+        self.assertEqual(results[0]["level"], "xian")
+        with mock.patch.object(dem, "_ruiduobao_request", return_value=io.BytesIO(sse.encode("utf-8"))):
+            filtered = dem._ruiduobao_search("锦江区", province="四川省", level="xian", limit=10)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["code"], "510104")
+
+    def test_resolve_admin_with_code_only(self):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[(104.0, 30.5), (104.2, 30.5), (104.2, 30.7), (104.0, 30.7), (104.0, 30.5)]],
+                    },
+                }
+            ],
+        }
+        with mock.patch.object(dem, "_ruiduobao_geojson_for_code", return_value=geojson):
+            result = dem.resolve_admin(name=None, code="510104", expand_km=1.0)
+        self.assertEqual(result["code"], "510104")
+        self.assertEqual(result["admin_level_code"], "xian")
+        self.assertEqual(result["bbox_wgs84"], [104.0, 30.5, 104.2, 30.7])
+        # expanded bbox should be larger on all four sides
+        rw, rs, re, rn = result["bbox_wgs84_expanded"]
+        self.assertLess(rw, 104.0)
+        self.assertLess(rs, 30.5)
+        self.assertGreater(re, 104.2)
+        self.assertGreater(rn, 30.7)
+        self.assertEqual(result["source"], "map.ruiduobao.com")
+        self.assertGreater(result["area_km2_expanded"], result["area_km2"])
+
+    def test_pick_admin_result_prefers_province_and_city(self):
+        items = [
+            {"name": "朝阳区", "code": "220104", "level": "xian", "province_name": "吉林省", "city_name": "长春市", "_scope": "nationwide"},
+            {"name": "朝阳区", "code": "110105", "level": "xian", "province_name": "北京市", "city_name": "北京市", "_scope": "province"},
+        ]
+        chosen = dem._pick_admin_result(items, "朝阳区", province="北京市", city="北京市", level="xian")
+        self.assertEqual(chosen["code"], "110105")
+
+    def test_pick_admin_result_raises_when_no_match(self):
+        with self.assertRaises(dem.DemError):
+            dem._pick_admin_result([], "蓬莱区", province="北京市", city=None, level="xian")
+
+    def test_resolve_aoi_uses_admin_metadata(self):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "geometry": {"type": "Polygon",
+                    "coordinates": [[(116.0, 39.8), (116.5, 39.8), (116.5, 40.2), (116.0, 40.2), (116.0, 39.8)]]}}
+            ],
+        }
+        with mock.patch.object(dem, "_ruiduobao_geojson_for_code", return_value=geojson):
+            args = argparse.Namespace(
+                admin="海淀区", admin_code=None, admin_province="北京市", admin_city=None,
+                admin_level="xian", admin_year=2023, admin_expand_km=2.0,
+                bbox=None, aoi=None,
+            )
+            bbox, geometries = dem.resolve_aoi(args)
+        self.assertIsNone(geometries)
+        # 2km expand; bbox strictly larger
+        w, s, e, n = bbox
+        self.assertLess(w, 116.0)
+        self.assertLess(s, 39.8)
+        self.assertGreater(e, 116.5)
+        self.assertGreater(n, 40.2)
+        meta = args.admin_metadata
+        self.assertEqual(meta["code"], "110108")  # 海淀区 = 110108
+
+    def test_admin_bbox_parser(self):
+        parser = dem.build_parser()
+        args = parser.parse_args([
+            "admin-bbox", "--name", "锦江区", "--province", "四川省",
+            "--city", "成都市", "--expand-km", "1.5",
+        ])
+        self.assertEqual(args.name, "锦江区")
+        self.assertEqual(args.expand_km, 1.5)
+        self.assertEqual(args.level, "xian")
+
+    def test_admin_parser_disallows_bbox_with_admin(self):
+        parser = dem.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "plan", "--admin", "锦江区", "--bbox", "104", "30", "105", "31",
+            ])
+
+    def test_plan_parser_accepts_admin(self):
+        parser = dem.build_parser()
+        args = parser.parse_args([
+            "plan",
+            "--admin", "锦江区", "--admin-province", "四川省",
+            "--admin-city", "成都市", "--source", "mpc",
+            "--dataset", "cop-dem-glo-30",
+        ])
+        self.assertEqual(args.admin, "锦江区")
+        self.assertEqual(args.command, "plan")
+        self.assertIsNone(args.bbox)
+        self.assertIsNone(args.aoi)
 
 
 if __name__ == "__main__":
